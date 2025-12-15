@@ -4,6 +4,10 @@
     "description": "Inspect and visualize single cell metadata from AnnData h5ad files",
     "version": "0.1.0",
     "publisher": "anndata-inspector",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/<owner>/anndata-design-inspector"
+    },
     "engines": {
         "vscode": "^1.85.0"
     },
