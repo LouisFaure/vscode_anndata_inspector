@@ -24,3 +24,7 @@ Inspect and visualize single cell metadata from AnnData (`.h5ad`) files directly
 2. Run `npm install`
 3. Run `npm run compile`
 4. Press F5 to debug in VS Code
+
+## Acknowledgments
+
+This VS Code extension was initially inspired by and translated from code in the [anndata-design-inspector](https://github.com/vals/anndata-design-inspector) repository.
