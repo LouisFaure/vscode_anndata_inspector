@@ -144,6 +144,32 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
     }
 
     private getErrorHtml(error: any): string {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isMissingTools = errorMessage.includes('HDF5 tools (h5ls, h5dump) are not installed');
+
+        let additionalHelp = '';
+        if (isMissingTools) {
+            additionalHelp = `
+            <h3>Installation Instructions</h3>
+            <p>This extension requires HDF5 tools to be installed on your system.</p>
+            
+            <h4>macOS</h4>
+            <pre>brew install hdf5</pre>
+            
+            <h4>Linux (Debian/Ubuntu)</h4>
+            <pre>sudo apt-get install hdf5-tools</pre>
+            `;
+        } else {
+            additionalHelp = `
+            <p>Please ensure:</p>
+            <ul>
+                <li>The file is a valid AnnData H5AD file</li>
+                <li>The file is not corrupted</li>
+                <li>You have read permissions for the file</li>
+            </ul>
+            `;
+        }
+
         return `<!DOCTYPE html>
 <html>
 <head>
@@ -164,6 +190,12 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
         pre {
             white-space: pre-wrap;
             word-wrap: break-word;
+            background: var(--vscode-textBlockQuote-background);
+            padding: 8px;
+            border-radius: 4px;
+        }
+        h4 {
+            margin-bottom: 8px;
         }
     </style>
 </head>
@@ -171,14 +203,9 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
     <h1>Error Loading H5AD File</h1>
     <div class="error">
         <p><strong>Failed to read the H5AD file.</strong></p>
-        <pre>${error instanceof Error ? error.message : String(error)}</pre>
+        <pre>${errorMessage}</pre>
     </div>
-    <p>Please ensure:</p>
-    <ul>
-        <li>The file is a valid AnnData H5AD file</li>
-        <li>The file is not corrupted</li>
-        <li>You have read permissions for the file</li>
-    </ul>
+    ${additionalHelp}
 </body>
 </html>`;
     }

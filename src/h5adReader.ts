@@ -76,6 +76,15 @@ async function runCommand(command: string, args: string[]): Promise<string> {
     }
 }
 
+async function checkHdf5Tools(): Promise<void> {
+    try {
+        await runCommand('h5ls', ['--version']);
+        await runCommand('h5dump', ['--version']);
+    } catch (error) {
+        throw new Error('HDF5 tools (h5ls, h5dump) are not installed or not in PATH.');
+    }
+}
+
 async function ensureLocalFile(filePath: string): Promise<{ path: string, isTemp: boolean }> {
     if (filePath.startsWith('http://') || filePath.startsWith('https://')) {
         const tempPath = getTempFilePath('h5ad_download');
@@ -596,6 +605,9 @@ export async function checkRaw(filePath: string): Promise<boolean> {
  * Read complete h5ad metadata for design analysis
  */
 export async function readH5ADMetadata(filePath: string, useRaw: boolean = false): Promise<H5ADMetadata> {
+    // Check for HDF5 tools first
+    await checkHdf5Tools();
+
     // We can reuse the local file path to avoid multiple downloads/copies
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     
