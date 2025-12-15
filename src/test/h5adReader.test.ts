@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as path from 'path';
 import { readH5ADMetadata, H5ADMetadata } from '../h5adReader';
 
-const TEST_FILE_PATH = path.resolve(__dirname, '../../adata_test.h5ad');
+const TEST_FILE_PATH = 'https://github.com/scverse/scanpy/raw/refs/heads/main/src/scanpy/datasets/10x_pbmc68k_reduced.h5ad';
 
 let metadata: H5ADMetadata;
 

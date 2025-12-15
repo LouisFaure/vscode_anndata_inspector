@@ -329,23 +329,52 @@ export async function countCells(filePath: string, factorName: string): Promise<
     }
 }
 
+async function getSparseMatrixShape(filePath: string, groupPath: string): Promise<number[]> {
+    try {
+        // h5dump -a groupPath/shape filePath
+        const stdout = await runCommand('h5dump', ['-a', `${groupPath}/shape`, filePath]);
+        // Parse DATA { (0): 700, 765 }
+        const dataBlock = stdout.match(/DATA \{([\s\S]*?)\}/);
+        if (dataBlock) {
+            const inner = dataBlock[1];
+            // Remove (0): and split
+            const clean = inner.replace(/\(\d+\):/g, '').trim();
+            const parts = clean.split(',').map(s => parseInt(s.trim()));
+            if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+                return parts;
+            }
+        }
+    } catch (e) {}
+    return [];
+}
+
 /**
  * Get total cell count from the h5ad file
  */
 export async function getTotalCells(filePath: string, prefix: string = ''): Promise<number> {
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        // Try obs/_index
-        try {
-            const info = await getDatasetInfo(localPath, '/obs/_index');
-            if (info.shape.length > 0) return info.shape[0];
-        } catch (e) {}
+        // Try obs/_index and obs/index
+        for (const idxPath of ['/obs/_index', '/obs/index']) {
+            try {
+                const info = await getDatasetInfo(localPath, idxPath);
+                if (info.shape.length > 0) return info.shape[0];
+            } catch (e) {}
+        }
 
         // Try X
         try {
             const xPath = prefix ? `${prefix}/X` : '/X';
             const info = await getDatasetInfo(localPath, xPath);
             if (info.shape.length > 0) return info.shape[0];
+            
+            // If empty shape, maybe it is sparse (Group)
+            const shape = await getSparseMatrixShape(localPath, xPath);
+            if (shape.length > 0) return shape[0];
+            
+            // Fallback: check indptr
+            const indptrInfo = await getDatasetInfo(localPath, `${xPath}/indptr`);
+            if (indptrInfo.shape.length > 0) return indptrInfo.shape[0] - 1;
         } catch (e) {}
 
         return 0;
@@ -413,14 +442,22 @@ export async function detectSpecies(filePath: string, prefix: string = ''): Prom
 export async function getGeneCount(filePath: string, prefix: string = ''): Promise<number> {
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        try {
-            const info = await getDatasetInfo(localPath, `${prefix}/var/_index`);
-            if (info.shape.length > 0) return info.shape[0];
-        } catch (e) {}
+        // Try var/_index and var/index
+        for (const idxPath of [`${prefix}/var/_index`, `${prefix}/var/index`]) {
+            try {
+                const info = await getDatasetInfo(localPath, idxPath);
+                if (info.shape.length > 0) return info.shape[0];
+            } catch (e) {}
+        }
 
         try {
-            const info = await getDatasetInfo(localPath, `${prefix}/X`);
+            const xPath = prefix ? `${prefix}/X` : '/X';
+            const info = await getDatasetInfo(localPath, xPath);
             if (info.shape.length > 1) return info.shape[1];
+            
+            // Sparse
+            const shape = await getSparseMatrixShape(localPath, xPath);
+            if (shape.length > 1) return shape[1];
         } catch (e) {}
 
         return 0;
