@@ -74,8 +74,5 @@
         "eslint": "^8.54.0",
         "mocha": "^11.7.5",
         "typescript": "^5.3.0"
-    },
-    "dependencies": {
-        "h5wasm": "^0.7.5"
     }
 }

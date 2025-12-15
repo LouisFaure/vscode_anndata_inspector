@@ -1,12 +1,18 @@
 /**
- * H5AD File Reader using h5wasm
+ * H5AD File Reader using system hdf5-tools (h5ls, h5dump)
  * 
  * Reads AnnData h5ad files and extracts experimental design information.
+ * Uses system tools to avoid memory limits and improve performance on large files.
  */
 
-import type * as h5wasmType from 'h5wasm';
-import * as path from 'path';
+import * as cp from 'child_process';
 import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import * as util from 'util';
+import * as crypto from 'crypto';
+
+const execFile = util.promisify(cp.execFile);
 
 export interface FactorInfo {
     name: string;
@@ -34,272 +40,359 @@ export interface H5ADMetadata {
     obsm: ObsmInfo[];
 }
 
-let h5wasmModule: typeof h5wasmType | null = null;
+// Helper to manage temp files
+const tempFiles: Set<string> = new Set();
 
-async function getH5Wasm(): Promise<typeof h5wasmType> {
-    if (!h5wasmModule) {
-        // Dynamic import workaround for CommonJS environment
-        // We use 'h5wasm/node' which is the correct entry point for Node.js
-        // Using eval to prevent TypeScript from transpiling import() to require()
-        const mod = await (eval('import("h5wasm/node")') as Promise<typeof h5wasmType>);
-        h5wasmModule = mod;
-    }
-    await h5wasmModule.ready;
-    return h5wasmModule;
+function getTempFilePath(prefix: string): string {
+    const tmpDir = os.tmpdir();
+    const name = `${prefix}_${crypto.randomBytes(6).toString('hex')}`;
+    const p = path.join(tmpDir, name);
+    tempFiles.add(p);
+    return p;
 }
 
-/**
- * Helper to fetch file content from URL
- */
-async function fetchFileBuffer(url: string): Promise<Buffer> {
-    const response = await fetch(url);
-    if (!response.ok) {
-        throw new Error(`Failed to fetch ${url}: ${response.statusText}`);
-    }
-    const arrayBuffer = await response.arrayBuffer();
-    return Buffer.from(arrayBuffer);
+function cleanupTempFile(p: string) {
+    try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+        tempFiles.delete(p);
+    } catch (e) {}
 }
 
-/**
- * Helper to open an H5AD file from disk or URL using h5wasm VFS
- */
-async function openH5File(filePath: string): Promise<h5wasmType.File> {
-    const h5 = await getH5Wasm();
-    
-    let fileBuffer: Buffer;
-    let fileName: string;
-    
-    // Check if it's a URL or local file path
+// Ensure cleanup on exit
+process.on('exit', () => {
+    for (const file of tempFiles) {
+        try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (e) {}
+    }
+});
+
+async function runCommand(command: string, args: string[]): Promise<string> {
+    try {
+        // Increase buffer for large outputs (e.g. h5ls -r on complex files)
+        const { stdout } = await execFile(command, args, { maxBuffer: 1024 * 1024 * 50 });
+        return stdout;
+    } catch (error: any) {
+        throw new Error(`Command failed: ${command} ${args.join(' ')}\n${error.message}`);
+    }
+}
+
+async function ensureLocalFile(filePath: string): Promise<{ path: string, isTemp: boolean }> {
     if (filePath.startsWith('http://') || filePath.startsWith('https://')) {
-        fileBuffer = await fetchFileBuffer(filePath);
-        // Extract filename from URL
-        fileName = filePath.split('/').pop() || 'h5ad_file.h5ad';
-    } else {
-        fileBuffer = fs.readFileSync(filePath);
-        fileName = path.basename(filePath);
+        const tempPath = getTempFilePath('h5ad_download');
+        const response = await fetch(filePath);
+        if (!response.ok) throw new Error(`Failed to fetch ${filePath}`);
+        const buffer = await response.arrayBuffer();
+        fs.writeFileSync(tempPath, Buffer.from(buffer));
+        return { path: tempPath, isTemp: true };
+    }
+    return { path: filePath, isTemp: false };
+}
+
+interface DatasetInfo {
+    shape: number[];
+    typeClass: 'string' | 'integer' | 'float' | 'other';
+    typeSize: number; // in bytes
+    isSigned: boolean;
+}
+
+async function getDatasetInfo(filePath: string, datasetPath: string): Promise<DatasetInfo> {
+    // Remove -d to avoid dumping data and exceeding buffer
+    const stdout = await runCommand('h5ls', ['-v', `${filePath}/${datasetPath}`]);
+    
+    // Parse Shape
+    // Output example: "    Dataset {10/10, 5/5}" or "    Dataset {10}"
+    const shapeMatch = stdout.match(/Dataset \{([0-9, \/]+)\}/);
+    const shape = shapeMatch 
+        ? shapeMatch[1].split(',').map(s => parseInt(s.split('/')[0].trim()))
+        : [];
+
+    // Parse Type
+    // Output example: "    Type:      Integer, 64-bit, little-endian"
+    // "    Type:      String, length = 10, null pad, ascii character set"
+    // "    Type:      native double"
+    // "    Type:      native int"
+    const typeMatch = stdout.match(/Type:\s+(.+)$/m);
+    const typeStr = (typeMatch ? typeMatch[1] : '').toLowerCase();
+
+    let typeClass: DatasetInfo['typeClass'] = 'other';
+    let typeSize = 1;
+    let isSigned = true;
+
+    if (typeStr.includes('integer') || typeStr.includes('int')) {
+        typeClass = 'integer';
+        if (typeStr.includes('8-bit')) typeSize = 1;
+        else if (typeStr.includes('16-bit')) typeSize = 2;
+        else if (typeStr.includes('32-bit')) typeSize = 4;
+        else if (typeStr.includes('64-bit')) typeSize = 8;
+        else typeSize = 4; // Default native integer
+
+        if (typeStr.includes('unsigned')) isSigned = false;
+    } else if (typeStr.includes('float') || typeStr.includes('double')) {
+        typeClass = 'float';
+        if (typeStr.includes('32-bit')) typeSize = 4;
+        else if (typeStr.includes('64-bit')) typeSize = 8;
+        else typeSize = 4;
+    } else if (typeStr.includes('string')) {
+        typeClass = 'string';
+        const lenMatch = typeStr.match(/length = (\d+)/);
+        if (lenMatch) typeSize = parseInt(lenMatch[1]);
+        else typeSize = 0; // Variable length?
     }
 
-    // Write to virtual file system
-    // FS is available on the module after ready
-    if (h5.FS) {
-        // Use /tmp to avoid read-only file system errors
-        try { h5.FS.mkdir('/tmp'); } catch (e) {}
-        const vfsPath = `/tmp/${fileName}`;
-        h5.FS.writeFile(vfsPath, new Uint8Array(fileBuffer));
-        return new h5.File(vfsPath, 'r');
-    }
+    return { shape, typeClass, typeSize, isSigned };
+}
 
-    return new h5.File(fileName, 'r');
+async function readDatasetBinary(filePath: string, datasetPath: string, info: DatasetInfo): Promise<Buffer> {
+    const tempBin = getTempFilePath('h5dump_bin');
+    try {
+        // -d dataset -b LE (Little Endian) -o output
+        await runCommand('h5dump', ['-d', datasetPath, '-b', 'LE', '-o', tempBin, filePath]);
+        if (fs.existsSync(tempBin)) {
+            return fs.readFileSync(tempBin);
+        }
+        return Buffer.alloc(0);
+    } finally {
+        cleanupTempFile(tempBin);
+    }
 }
 
 /**
  * List all categorical factors in the /obs section of an h5ad file
  */
 export async function listFactors(filePath: string): Promise<string[]> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-    const factors: string[] = [];
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        const obs = file.get('obs');
-        if (obs && obs instanceof h5.Group) {
-            const keys = obs.keys();
+        // Optimize: Only list /obs to avoid scanning the whole file
+        // h5ls -r file/obs
+        let stdout = '';
+        let isObsScan = false;
+        try {
+            stdout = await runCommand('h5ls', ['-r', localPath + '/obs']);
+            isObsScan = true;
+        } catch (e) {
+            // Fallback to full scan if /obs direct access fails
+            stdout = await runCommand('h5ls', ['-r', localPath]);
+        }
 
-            for (const key of keys) {
-                const item = obs.get(key);
-                // Check if it's a Group (categorical in h5ad format)
-                if (item && item instanceof h5.Group) {
-                    // Verify it has 'categories' and 'codes' datasets (categorical structure)
-                    const groupKeys = item.keys();
-                    if (groupKeys.includes('categories') && groupKeys.includes('codes')) {
-                        factors.push(key);
+        const lines = stdout.split('\n');
+        
+        // Find groups in obs that have both categories and codes
+        // Map: groupPath -> Set of children
+        const groups = new Map<string, Set<string>>();
+        
+        for (const line of lines) {
+            // Line format: /path/to/obj  Type
+            const parts = line.trim().split(/\s+/);
+            if (parts.length < 2) continue;
+            
+            let objPath = parts[0];
+            
+            if (isObsScan) {
+                // If we listed /obs, paths are relative to it (e.g. /factor or factor)
+                // We need to reconstruct full path /obs/factor
+                if (objPath.startsWith('/')) {
+                    // /factor -> /obs/factor
+                    // But check if it already starts with /obs/ (unlikely based on observation)
+                    if (!objPath.startsWith('/obs/')) {
+                        objPath = '/obs' + objPath;
                     }
+                } else {
+                    // factor -> /obs/factor
+                    objPath = '/obs/' + objPath;
                 }
             }
-        }
-    } finally {
-        file.close();
-        // Clean up VFS to save memory
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
-    }
 
-    return factors.sort();
+            if (objPath.startsWith('/obs/')) {
+                const parent = path.dirname(objPath);
+                const name = path.basename(objPath);
+                
+                if (!groups.has(parent)) groups.set(parent, new Set());
+                groups.get(parent)?.add(name);
+            }
+        }
+
+        const factors: string[] = [];
+        for (const [groupPath, children] of groups) {
+            if (children.has('categories') && children.has('codes')) {
+                // groupPath is like /obs/factorName
+                const factorName = path.basename(groupPath);
+                factors.push(factorName);
+            }
+        }
+        return factors.sort();
+
+    } finally {
+        if (isTemp) cleanupTempFile(localPath);
+    }
 }
 
 /**
  * Extract category names from a categorical factor
  */
 export async function extractCategories(filePath: string, factorName: string): Promise<string[]> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-    const categories: string[] = [];
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        const categoriesPath = `obs/${factorName}/categories`;
-        const dataset = file.get(categoriesPath);
-
-        if (dataset && dataset instanceof h5.Dataset) {
-            const values = dataset.value;
-
-            if (Array.isArray(values) || ArrayBuffer.isView(values)) {
-                // Handle different array types
-                const arr = values as any[];
-                for (const val of arr) {
-                    categories.push(String(val));
+        const datasetPath = `/obs/${factorName}/categories`;
+        const info = await getDatasetInfo(localPath, datasetPath);
+        
+        if (info.typeClass === 'string' && info.typeSize > 0) {
+            // Fixed length strings
+            const buffer = await readDatasetBinary(localPath, datasetPath, info);
+            const categories: string[] = [];
+            const count = info.shape[0] || 0;
+            
+            for (let i = 0; i < count; i++) {
+                const start = i * info.typeSize;
+                const end = start + info.typeSize;
+                if (end <= buffer.length) {
+                    // Read string and trim nulls
+                    let str = buffer.toString('utf8', start, end);
+                    // Remove null termination and padding
+                    str = str.replace(/\0/g, '');
+                    categories.push(str);
                 }
             }
+            return categories;
+        } else {
+            // Variable length or other: fallback to text dump
+            // h5dump -d path -y -w 0
+            const stdout = await runCommand('h5dump', ['-d', datasetPath, '-y', '-w', '0', localPath]);
+            // Parse text output
+            // Look for strings in quotes
+            const matches = stdout.matchAll(/"(.*?)"/g);
+            const categories: string[] = [];
+            for (const m of matches) {
+                if (m[1] !== 'HDF5') { // Skip header if matched accidentally
+                     categories.push(m[1]);
+                }
+            }
+            // Filter out header noise if any
+            // Usually data block is inside DATA { ... }
+            // Simple regex might be risky but h5dump output is structured.
+            // Better: extract content inside DATA { ... } first.
+            const dataBlock = stdout.match(/DATA \{([\s\S]*?)\}/);
+            if (dataBlock) {
+                const inner = dataBlock[1];
+                const innerMatches = inner.matchAll(/"(.*?)"/g);
+                return Array.from(innerMatches, m => m[1]);
+            }
+            return [];
         }
     } finally {
-        file.close();
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
+        if (isTemp) cleanupTempFile(localPath);
     }
-
-    return categories;
 }
 
 /**
  * Count cells per category for a factor
  */
 export async function countCells(filePath: string, factorName: string): Promise<Map<string, number>> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-    const counts = new Map<string, number>();
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        // We need categories to map codes
-        // Getting them from file again to avoid re-opening file multiple times if called separately
-        // But here we are already inside an open file context, so we read directly
+        const categories = await extractCategories(localPath, factorName);
+        const counts = new Map<string, number>();
+        categories.forEach(c => counts.set(c, 0));
 
-        let categories: string[] = [];
-        const catDataset = file.get(`obs/${factorName}/categories`);
-        if (catDataset && catDataset instanceof h5.Dataset) {
-            const values = catDataset.value;
-            if (Array.isArray(values) || ArrayBuffer.isView(values)) {
-                const arr = values as any[];
-                categories = arr.map(v => String(v));
-            }
-        }
+        const codesPath = `/obs/${factorName}/codes`;
+        const info = await getDatasetInfo(localPath, codesPath);
+        
+        if (info.typeClass === 'integer') {
+            const buffer = await readDatasetBinary(localPath, codesPath, info);
+            
+            // Create typed array view
+            let view: ArrayLike<number>;
+            if (info.typeSize === 1) view = info.isSigned ? new Int8Array(buffer.buffer) : new Uint8Array(buffer.buffer);
+            else if (info.typeSize === 2) view = info.isSigned ? new Int16Array(buffer.buffer) : new Uint16Array(buffer.buffer);
+            else if (info.typeSize === 4) view = info.isSigned ? new Int32Array(buffer.buffer) : new Uint32Array(buffer.buffer);
+            else view = new Int32Array(buffer.buffer); // Fallback for 64-bit (might lose precision but codes are usually small)
 
-        // Get codes
-        const codesPath = `obs/${factorName}/codes`;
-        const codesDataset = file.get(codesPath);
-
-        if (codesDataset && codesDataset instanceof h5.Dataset) {
-            const codes = codesDataset.value as any; // Typed array
-
-            // Initialize counts
-            for (const cat of categories) {
-                counts.set(cat, 0);
-            }
-
-            // Count occurrences
-            // Iterate over typed array
-            if (codes.length) {
-                for (let i = 0; i < codes.length; i++) {
-                    const code = codes[i];
-                    if (code >= 0 && code < categories.length) {
-                        const cat = categories[code];
-                        counts.set(cat, (counts.get(cat) || 0) + 1);
-                    }
+            for (let i = 0; i < view.length; i++) {
+                const code = view[i];
+                if (code >= 0 && code < categories.length) {
+                    const cat = categories[code];
+                    counts.set(cat, (counts.get(cat) || 0) + 1);
                 }
             }
         }
+        return counts;
     } finally {
-        file.close();
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
+        if (isTemp) cleanupTempFile(localPath);
     }
-
-    return counts;
 }
 
 /**
  * Get total cell count from the h5ad file
  */
 export async function getTotalCells(filePath: string): Promise<number> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        // Check obs/_index for cell count
-        const indexDataset = file.get('obs/_index');
-        if (indexDataset && indexDataset instanceof h5.Dataset) {
-            return indexDataset.shape ? indexDataset.shape[0] : 0;
-        }
+        // Try obs/_index
+        try {
+            const info = await getDatasetInfo(localPath, '/obs/_index');
+            if (info.shape.length > 0) return info.shape[0];
+        } catch (e) {}
 
-        // Fallback: check X matrix shape
-        const xDataset = file.get('X');
-        if (xDataset && xDataset instanceof h5.Dataset) {
-            return xDataset.shape ? xDataset.shape[0] : 0;
-        }
+        // Try X
+        try {
+            const info = await getDatasetInfo(localPath, '/X');
+            if (info.shape.length > 0) return info.shape[0];
+        } catch (e) {}
+
+        return 0;
     } finally {
-        file.close();
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
+        if (isTemp) cleanupTempFile(localPath);
     }
-
-    return 0;
 }
 
 /**
  * Detect species from gene naming patterns in /var
  */
 export async function detectSpecies(filePath: string): Promise<string> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        // Try to get gene names from var/_index or var/gene_symbols etc.
-        const possiblePaths = ['var/_index', 'var/index', 'var/gene_symbols', 'var/gene_names'];
+        const possiblePaths = ['/var/_index', '/var/index', '/var/gene_symbols', '/var/gene_names'];
         let geneNames: string[] = [];
 
         for (const varPath of possiblePaths) {
-            const dataset = file.get(varPath);
-            if (dataset && dataset instanceof h5.Dataset) {
-                const values = dataset.value;
-                if ((Array.isArray(values) || ArrayBuffer.isView(values)) && values.length > 0) {
-                    // Take first 50
-                    const arr = values as any[];
-                    geneNames = arr.slice(0, 50).map(v => String(v));
-                    break;
+            try {
+                // Read first 50 items
+                // h5dump -d path -s 0 -c 50 -y -w 0
+                const stdout = await runCommand('h5dump', ['-d', varPath, '-s', '0', '-c', '50', '-y', '-w', '0', localPath]);
+                const dataBlock = stdout.match(/DATA \{([\s\S]*?)\}/);
+                if (dataBlock) {
+                    const inner = dataBlock[1];
+                    // Match strings
+                    const matches = Array.from(inner.matchAll(/"(.*?)"/g), m => m[1]);
+                    if (matches.length > 0) {
+                        geneNames = matches;
+                        break;
+                    }
                 }
-            }
+            } catch (e) {}
         }
 
-        if (geneNames.length === 0) {
-            return 'unknown';
-        }
+        if (geneNames.length === 0) return 'unknown';
 
         // Analyze naming patterns
-        let uppercase = 0;  // Human: ACTB, GAPDH
-        let titlecase = 0;  // Mouse: Actb, Gapdh
-        let lowercase = 0;  // Zebrafish: actb, gapdh
+        let uppercase = 0;
+        let titlecase = 0;
+        let lowercase = 0;
 
         for (const gene of geneNames) {
-            if (/^[A-Z][A-Z0-9]+$/.test(gene)) {
-                uppercase++;
-            } else if (/^[A-Z][a-z0-9]+$/.test(gene)) {
-                titlecase++;
-            } else if (/^[a-z][a-z0-9]+$/.test(gene)) {
-                lowercase++;
-            }
+            if (/^[A-Z][A-Z0-9]+$/.test(gene)) uppercase++;
+            else if (/^[A-Z][a-z0-9]+$/.test(gene)) titlecase++;
+            else if (/^[a-z][a-z0-9]+$/.test(gene)) lowercase++;
         }
 
         const total = uppercase + titlecase + lowercase;
-        if (total === 0) {
-            return 'unknown';
-        }
+        if (total === 0) return 'unknown';
 
-        if (uppercase / total > 0.5) {
-            return 'human';
-        } else if (titlecase / total > 0.5) {
-            return 'mouse';
-        } else if (lowercase / total > 0.5) {
-            return 'zebrafish';
-        }
+        if (uppercase / total > 0.5) return 'human';
+        else if (titlecase / total > 0.5) return 'mouse';
+        else if (lowercase / total > 0.5) return 'zebrafish';
 
         return 'unknown';
     } finally {
-        file.close();
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
+        if (isTemp) cleanupTempFile(localPath);
     }
 }
 
@@ -307,192 +400,218 @@ export async function detectSpecies(filePath: string): Promise<string> {
  * Get gene count from the h5ad file
  */
 export async function getGeneCount(filePath: string): Promise<number> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        // Check var/_index or var/index
-        const possiblePaths = ['var/_index', 'var/index'];
-        for (const p of possiblePaths) {
-            const dataset = file.get(p);
-            if (dataset && dataset instanceof h5.Dataset) {
-                return dataset.shape ? dataset.shape[0] : 0;
-            }
-        }
+        try {
+            const info = await getDatasetInfo(localPath, '/var/_index');
+            if (info.shape.length > 0) return info.shape[0];
+        } catch (e) {}
 
-        // Check any dataset in var
-        const varGroup = file.get('var');
-        if (varGroup && varGroup instanceof h5.Group) {
-             const keys = varGroup.keys();
-             if (keys.length > 0) {
-                 const first = varGroup.get(keys[0]);
-                 if (first && first instanceof h5.Dataset) {
-                     return first.shape ? first.shape[0] : 0;
-                 }
-             }
-        }
+        try {
+            const info = await getDatasetInfo(localPath, '/X');
+            if (info.shape.length > 1) return info.shape[1];
+        } catch (e) {}
 
-        // Fallback: check X matrix shape (n_obs, n_vars)
-        const xDataset = file.get('X');
-        if (xDataset && xDataset instanceof h5.Dataset) {
-            return xDataset.shape && xDataset.shape.length > 1 ? xDataset.shape[1] : 0;
-        }
+        return 0;
     } finally {
-        file.close();
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
+        if (isTemp) cleanupTempFile(localPath);
     }
+}
 
-    return 0;
+/**
+ * Read first 5 values from a dataset to check for integer/float content
+ */
+async function readFirstFiveValues(filePath: string, datasetPath: string): Promise<number[]> {
+    try {
+        // h5dump -d datasetPath -s 0 -c 5 -y -w 0 filePath
+        const stdout = await runCommand('h5dump', ['-d', datasetPath, '-s', '0', '-c', '5', '-y', '-w', '0', filePath]);
+        const dataBlock = stdout.match(/DATA \{([\s\S]*?)\}/);
+        if (dataBlock) {
+            const inner = dataBlock[1];
+            // Split by comma or whitespace
+            const items = inner.split(/,?\s+/).filter(s => s.trim() !== '');
+            const values: number[] = [];
+            for (const item of items) {
+                // Remove quotes if string (shouldn't happen for matrix data)
+                const cleanItem = item.replace(/"/g, '');
+                const val = parseFloat(cleanItem);
+                if (!isNaN(val)) values.push(val);
+                if (values.length >= 5) break;
+            }
+            return values;
+        }
+    } catch (e) {}
+    return [];
+}
+
+/**
+ * Check matrix type (integer or float)
+ * For sparse matrices (isDense=false), checks actual values if storage is float.
+ * For dense matrices (isDense=true), relies on storage type to save time.
+ */
+async function checkMatrixType(filePath: string, datasetPath: string, isDense: boolean): Promise<'integer' | 'float'> {
+    try {
+        const info = await getDatasetInfo(filePath, datasetPath);
+        if (info.typeClass === 'integer') return 'integer';
+        
+        if (isDense) {
+            // If dense, just say it is dense (float) and skip value check
+            return 'float';
+        }
+
+        // If sparse and float storage, check first 5 non-zero values
+        const values = await readFirstFiveValues(filePath, datasetPath);
+        if (values.length === 0) return 'float'; // Default
+        
+        const allIntegers = values.every(v => Number.isInteger(v));
+        return allIntegers ? 'integer' : 'float';
+    } catch (e) {
+        return 'float';
+    }
 }
 
 /**
  * Analyze matrices (.X and layers) for data types
  */
 export async function analyzeMatrices(filePath: string): Promise<MatrixInfo[]> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-    const matrices: MatrixInfo[] = [];
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        // Check .X
-        const xType = await getMatrixType(file, 'X', h5);
-        matrices.push({ name: 'X', type: xType });
-
-        // Check layers
-        const layers = file.get('layers');
-        if (layers && layers instanceof h5.Group) {
-            for (const key of layers.keys()) {
-                const type = await getMatrixType(file, `layers/${key}`, h5);
-                matrices.push({ name: `layers/${key}`, type });
-            }
-        }
-    } finally {
-        file.close();
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
-    }
-    return matrices;
-}
-
-async function getMatrixType(file: h5wasmType.File, path: string, h5: typeof h5wasmType): Promise<'integer' | 'float'> {
-    const item = file.get(path);
-    if (!item) return 'float';
-
-    let dataDataset: h5wasmType.Dataset | null = null;
-
-    if (item instanceof h5.Dataset) {
-        dataDataset = item;
-    } else if (item instanceof h5.Group) {
-        const dataItem = item.get('data');
-        if (dataItem && dataItem instanceof h5.Dataset) {
-            dataDataset = dataItem;
-        }
-    }
-
-    if (dataDataset && dataDataset.shape) {
-        // Check dtype
-        // If it's explicitly integer type
-        if (String(dataDataset.dtype).includes('int')) return 'integer';
-
-        // Read first few values to check if they are effectively integers
+        const matrices: MatrixInfo[] = [];
+        
+        // Check X
         try {
-            let selection: any[] = [];
-            if (dataDataset.shape.length === 1) {
-                selection = [[0, Math.min(5, dataDataset.shape[0])]];
-            } else {
-                selection = dataDataset.shape.map((dim, i) => {
-                    if (i === 0) return [0, 1]; // 1 row
-                    if (i === 1) return [0, Math.min(5, dim)]; // 5 cols
-                    return [0, 1];
-                });
+            // Check if X is group (sparse) or dataset (dense)
+            // h5ls localPath/X
+            const stdout = await runCommand('h5ls', [localPath + '/X']);
+            
+            let isSparse = false;
+            // Sparse matrix in AnnData is a Group containing data, indices, indptr
+            if (stdout.includes('data') && stdout.includes('indices') && stdout.includes('indptr')) {
+                isSparse = true;
             }
             
-            const values = dataDataset.slice(selection);
-            if (values) {
-                let arr: any[] = [];
-                if (Array.isArray(values)) {
-                    arr = (values as any[]).flat(Infinity);
-                } else {
-                    arr = Array.from(values as any);
-                }
-                
-                // Check if all are integers
-                const allInt = arr.every((n: any) => typeof n === 'number' && n % 1 === 0);
-                return allInt ? 'integer' : 'float';
+            if (isSparse) {
+                const type = await checkMatrixType(localPath, '/X/data', false);
+                matrices.push({ name: 'X', type });
+            } else {
+                // Dense
+                const type = await checkMatrixType(localPath, '/X', true);
+                matrices.push({ name: 'X', type });
             }
-        } catch (e) {
-            // Fallback if slice fails
-            return 'float';
-        }
-    }
+        } catch (e) {}
 
-    return 'float';
+        // Check layers
+        try {
+            const stdout = await runCommand('h5ls', [localPath + '/layers']);
+            const lines = stdout.split('\n');
+            for (const line of lines) {
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 1) {
+                    const name = parts[0];
+                    if (name) {
+                        try {
+                            // Check if layer is sparse or dense
+                            const layerPath = `/layers/${name}`;
+                            // We need to check if it is a group or dataset.
+                            // h5ls localPath/layers/name
+                            let isLayerSparse = false;
+                            try {
+                                const layerStdout = await runCommand('h5ls', [localPath + layerPath]);
+                                if (layerStdout.includes('data') && layerStdout.includes('indices') && layerStdout.includes('indptr')) {
+                                    isLayerSparse = true;
+                                }
+                            } catch (e) {}
+
+                            if (isLayerSparse) {
+                                const type = await checkMatrixType(localPath, `${layerPath}/data`, false);
+                                matrices.push({ name: `layers/${name}`, type });
+                            } else {
+                                const type = await checkMatrixType(localPath, layerPath, true);
+                                matrices.push({ name: `layers/${name}`, type });
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+        } catch (e) {}
+
+        return matrices;
+    } finally {
+        if (isTemp) cleanupTempFile(localPath);
+    }
 }
 
 /**
  * Analyze obsm entries
  */
 export async function analyzeObsm(filePath: string): Promise<ObsmInfo[]> {
-    const file = await openH5File(filePath);
-    const h5 = await getH5Wasm();
-    const obsmInfo: ObsmInfo[] = [];
-
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        const obsm = file.get('obsm');
-        if (obsm && obsm instanceof h5.Group) {
-            for (const key of obsm.keys()) {
-                const item = obsm.get(key);
-                if (item && item instanceof h5.Dataset && item.shape) {
-                    // shape is (n_obs, n_features)
-                    const columns = item.shape.length > 1 ? item.shape[1] : 1;
-                    obsmInfo.push({ name: key, columns });
+        const obsmInfo: ObsmInfo[] = [];
+        try {
+            const stdout = await runCommand('h5ls', [localPath + '/obsm']);
+            const lines = stdout.split('\n');
+            for (const line of lines) {
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 1) {
+                    const name = parts[0];
+                    if (name) {
+                        try {
+                            const info = await getDatasetInfo(localPath, `/obsm/${name}`);
+                            const columns = info.shape.length > 1 ? info.shape[1] : 1;
+                            obsmInfo.push({ name, columns });
+                        } catch (e) {}
+                    }
                 }
             }
-        }
+        } catch (e) {}
+        return obsmInfo;
     } finally {
-        file.close();
-        try { if (h5.FS) h5.FS.unlink(`/tmp/${path.basename(filePath)}`); } catch (e) { }
+        if (isTemp) cleanupTempFile(localPath);
     }
-    return obsmInfo;
 }
 
 /**
  * Read complete h5ad metadata for design analysis
  */
 export async function readH5ADMetadata(filePath: string): Promise<H5ADMetadata> {
-    // We get individual pieces. Optimization: open file once and read everything.
-    // However, to ensure consistency and speed, let's implement a single pass version
-    // or just call them sequentially. calling sequentially is fine for now.
+    // We can reuse the local file path to avoid multiple downloads/copies
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
+    
+    try {
+        const totalCells = await getTotalCells(localPath);
+        const species = await detectSpecies(localPath);
+        const geneCount = await getGeneCount(localPath);
+        const factorNames = await listFactors(localPath);
+        const matrices = await analyzeMatrices(localPath);
+        const obsm = await analyzeObsm(localPath);
 
-    const totalCells = await getTotalCells(filePath);
-    const species = await detectSpecies(filePath);
-    const geneCount = await getGeneCount(filePath);
-    const factorNames = await listFactors(filePath);
-    const matrices = await analyzeMatrices(filePath);
-    const obsm = await analyzeObsm(filePath);
+        const factors = new Map<string, FactorInfo>();
 
-    const factors = new Map<string, FactorInfo>();
+        for (const name of factorNames) {
+            const categories = await extractCategories(localPath, name);
+            const cellCounts = await countCells(localPath, name);
+            const counts = categories.map(cat => cellCounts.get(cat) || 0);
 
-    for (const name of factorNames) {
-        const categories = await extractCategories(filePath, name);
-        const cellCounts = await countCells(filePath, name);
-        const counts = categories.map(cat => cellCounts.get(cat) || 0);
+            let type: FactorInfo['type'] = 'experimental';
+            const nameLower = name.toLowerCase();
 
-        // Determine factor type based on name heuristics
-        let type: FactorInfo['type'] = 'experimental';
-        const nameLower = name.toLowerCase();
+            if (nameLower.includes('cell_type') || nameLower.includes('celltype') ||
+                nameLower.includes('cluster') || nameLower.includes('annotation')) {
+                type = 'classification';
+            } else if (nameLower.includes('sample') || nameLower.includes('replicate') ||
+                nameLower.includes('donor') || nameLower.includes('patient')) {
+                type = 'replicate';
+            } else if (nameLower.includes('batch') || nameLower.includes('library')) {
+                type = 'batch';
+            }
 
-        if (nameLower.includes('cell_type') || nameLower.includes('celltype') ||
-            nameLower.includes('cluster') || nameLower.includes('annotation')) {
-            type = 'classification';
-        } else if (nameLower.includes('sample') || nameLower.includes('replicate') ||
-            nameLower.includes('donor') || nameLower.includes('patient')) {
-            type = 'replicate';
-        } else if (nameLower.includes('batch') || nameLower.includes('library')) {
-            type = 'batch';
+            factors.set(name, { name, categories, counts, type });
         }
 
-        factors.set(name, { name, categories, counts, type });
+        return { totalCells, factors, species, geneCount, matrices, obsm };
+    } finally {
+        if (isTemp) cleanupTempFile(localPath);
     }
-
-    return { totalCells, factors, species, geneCount, matrices, obsm };
 }
+
