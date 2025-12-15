@@ -61,13 +61,41 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
             // Handle messages from webview
             webviewPanel.webview.onDidReceiveMessage(
                 async message => {
-                    // No messages handled currently
+                    if (message.command === 'viewRaw') {
+                        this.openRawView(document.uri);
+                    }
                 },
                 undefined,
                 this.context.subscriptions
             );
         } catch (error) {
             webviewPanel.webview.html = this.getErrorHtml(error);
+        }
+    }
+
+    private async openRawView(uri: vscode.Uri) {
+        const panel = vscode.window.createWebviewPanel(
+            'anndata.rawViewer',
+            `Raw Data: ${path.basename(uri.fsPath)}`,
+            vscode.ViewColumn.Beside,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true
+            }
+        );
+
+        panel.webview.html = this.getLoadingHtml();
+
+        try {
+            const metadata = await readH5ADMetadata(uri.fsPath, true);
+            panel.webview.html = this.getWebviewContent(
+                panel.webview,
+                uri.fsPath,
+                metadata,
+                true
+            );
+        } catch (error) {
+            panel.webview.html = this.getErrorHtml(error);
         }
     }
 
@@ -158,7 +186,8 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
     private getWebviewContent(
         webview: vscode.Webview,
         filePath: string,
-        metadata: any
+        metadata: any,
+        isRawView: boolean = false
     ): string {
         const fileName = path.basename(filePath);
         const fileSize = this.formatFileSize(filePath);
@@ -192,6 +221,9 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
             })
             .join('');
 
+        const rawButton = (metadata.hasRaw && !isRawView) 
+            ? `<button onclick="vscode.postMessage({command: 'viewRaw'})" class="raw-btn">View Raw Data</button>`
+            : '';
 
         return `<!DOCTYPE html>
 <html>
@@ -214,9 +246,9 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
             margin: 0 auto;
         }
         h1 {
-            border-bottom: 2px solid var(--border-color);
-            padding-bottom: 12px;
-            margin-bottom: 24px;
+            margin: 0;
+            border: none;
+            padding: 0;
         }
         h2 {
             color: var(--accent-color);
@@ -235,6 +267,9 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
             align-items: center;
             flex-wrap: wrap;
             gap: 16px;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 12px;
+            margin-bottom: 24px;
         }
         .meta-grid {
             display: grid;
@@ -345,6 +380,13 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
         button:hover {
             background: var(--vscode-button-hoverBackground);
         }
+        .raw-btn {
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+        }
+        .raw-btn:hover {
+            background: var(--vscode-button-secondaryHoverBackground);
+        }
         .section-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -356,6 +398,7 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
 <body>
     <div class="header">
         <h1>📊 ${fileName}</h1>
+        ${rawButton}
     </div>
     
     <div class="meta-grid">

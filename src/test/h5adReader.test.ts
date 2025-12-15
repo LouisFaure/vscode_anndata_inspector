@@ -2,7 +2,7 @@ import * as assert from 'assert';
 import * as path from 'path';
 import { readH5ADMetadata, H5ADMetadata } from '../h5adReader';
 
-const TEST_FILE_PATH = path.resolve(__dirname, '../../adata_CH.h5ad');
+const TEST_FILE_PATH = path.resolve(__dirname, '../../adata_test.h5ad');
 
 let metadata: H5ADMetadata;
 
@@ -28,6 +28,7 @@ describe('H5AD Reader Test Suite', () => {
         assert.ok(metadata.geneCount > 0, 'Gene count should be greater than 0');
         assert.ok(metadata.factors.size > 0, 'Should have detected factors');
         // assert.notStrictEqual(metadata.species, 'unknown', 'Should detect species'); // Species detection might fail on reduced data
+        assert.strictEqual(metadata.hasRaw, true, 'Should  have raw data');
     });
 });
 
@@ -47,5 +48,16 @@ describe('H5AD Reader Data Structure Test Suite', () => {
         // Check X
         const x = metadata.matrices.find(m => m.name === 'X');
         assert.ok(x, 'Should have X matrix');
+    });
+
+    it('should read raw metadata correctly', async function() {
+        const rawMetadata = await readH5ADMetadata(TEST_FILE_PATH, true);
+        assert.strictEqual(rawMetadata.hasRaw, true, 'Should detect raw data');
+        // Total cells should match
+        assert.strictEqual(rawMetadata.totalCells, metadata.totalCells, 'Total cells should match');
+        // Should have matrices (at least raw/X)
+        assert.ok(rawMetadata.matrices.length > 0, 'Should have raw matrices');
+        const rawX = rawMetadata.matrices.find(m => m.name === 'raw/X');
+        assert.ok(rawX, 'Should have raw/X matrix');
     });
 });

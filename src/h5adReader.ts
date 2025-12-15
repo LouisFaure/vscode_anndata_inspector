@@ -38,6 +38,7 @@ export interface H5ADMetadata {
     geneCount: number;
     matrices: MatrixInfo[];
     obsm: ObsmInfo[];
+    hasRaw: boolean;
 }
 
 // Helper to manage temp files
@@ -322,7 +323,7 @@ export async function countCells(filePath: string, factorName: string): Promise<
 /**
  * Get total cell count from the h5ad file
  */
-export async function getTotalCells(filePath: string): Promise<number> {
+export async function getTotalCells(filePath: string, prefix: string = ''): Promise<number> {
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
         // Try obs/_index
@@ -333,7 +334,8 @@ export async function getTotalCells(filePath: string): Promise<number> {
 
         // Try X
         try {
-            const info = await getDatasetInfo(localPath, '/X');
+            const xPath = prefix ? `${prefix}/X` : '/X';
+            const info = await getDatasetInfo(localPath, xPath);
             if (info.shape.length > 0) return info.shape[0];
         } catch (e) {}
 
@@ -346,10 +348,10 @@ export async function getTotalCells(filePath: string): Promise<number> {
 /**
  * Detect species from gene naming patterns in /var
  */
-export async function detectSpecies(filePath: string): Promise<string> {
+export async function detectSpecies(filePath: string, prefix: string = ''): Promise<string> {
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
-        const possiblePaths = ['/var/_index', '/var/index', '/var/gene_symbols', '/var/gene_names'];
+        const possiblePaths = [`${prefix}/var/_index`, `${prefix}/var/index`, `${prefix}/var/gene_symbols`, `${prefix}/var/gene_names`];
         let geneNames: string[] = [];
 
         for (const varPath of possiblePaths) {
@@ -399,16 +401,16 @@ export async function detectSpecies(filePath: string): Promise<string> {
 /**
  * Get gene count from the h5ad file
  */
-export async function getGeneCount(filePath: string): Promise<number> {
+export async function getGeneCount(filePath: string, prefix: string = ''): Promise<number> {
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
         try {
-            const info = await getDatasetInfo(localPath, '/var/_index');
+            const info = await getDatasetInfo(localPath, `${prefix}/var/_index`);
             if (info.shape.length > 0) return info.shape[0];
         } catch (e) {}
 
         try {
-            const info = await getDatasetInfo(localPath, '/X');
+            const info = await getDatasetInfo(localPath, `${prefix}/X`);
             if (info.shape.length > 1) return info.shape[1];
         } catch (e) {}
 
@@ -473,7 +475,7 @@ async function checkMatrixType(filePath: string, datasetPath: string, isDense: b
 /**
  * Analyze matrices (.X and layers) for data types
  */
-export async function analyzeMatrices(filePath: string): Promise<MatrixInfo[]> {
+export async function analyzeMatrices(filePath: string, prefix: string = ''): Promise<MatrixInfo[]> {
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
         const matrices: MatrixInfo[] = [];
@@ -482,7 +484,8 @@ export async function analyzeMatrices(filePath: string): Promise<MatrixInfo[]> {
         try {
             // Check if X is group (sparse) or dataset (dense)
             // h5ls localPath/X
-            const stdout = await runCommand('h5ls', [localPath + '/X']);
+            const xPath = prefix ? `${prefix}/X` : '/X';
+            const stdout = await runCommand('h5ls', [localPath + xPath]);
             
             let isSparse = false;
             // Sparse matrix in AnnData is a Group containing data, indices, indptr
@@ -491,49 +494,51 @@ export async function analyzeMatrices(filePath: string): Promise<MatrixInfo[]> {
             }
             
             if (isSparse) {
-                const type = await checkMatrixType(localPath, '/X/data', false);
-                matrices.push({ name: 'X', type });
+                const type = await checkMatrixType(localPath, `${xPath}/data`, false);
+                matrices.push({ name: prefix ? 'raw/X' : 'X', type });
             } else {
                 // Dense
-                const type = await checkMatrixType(localPath, '/X', true);
-                matrices.push({ name: 'X', type });
+                const type = await checkMatrixType(localPath, xPath, true);
+                matrices.push({ name: prefix ? 'raw/X' : 'X', type });
             }
         } catch (e) {}
 
-        // Check layers
-        try {
-            const stdout = await runCommand('h5ls', [localPath + '/layers']);
-            const lines = stdout.split('\n');
-            for (const line of lines) {
-                const parts = line.trim().split(/\s+/);
-                if (parts.length >= 1) {
-                    const name = parts[0];
-                    if (name) {
-                        try {
-                            // Check if layer is sparse or dense
-                            const layerPath = `/layers/${name}`;
-                            // We need to check if it is a group or dataset.
-                            // h5ls localPath/layers/name
-                            let isLayerSparse = false;
+        if (!prefix) {
+            // Check layers
+            try {
+                const stdout = await runCommand('h5ls', [localPath + '/layers']);
+                const lines = stdout.split('\n');
+                for (const line of lines) {
+                    const parts = line.trim().split(/\s+/);
+                    if (parts.length >= 1) {
+                        const name = parts[0];
+                        if (name) {
                             try {
-                                const layerStdout = await runCommand('h5ls', [localPath + layerPath]);
-                                if (layerStdout.includes('data') && layerStdout.includes('indices') && layerStdout.includes('indptr')) {
-                                    isLayerSparse = true;
+                                // Check if layer is sparse or dense
+                                const layerPath = `/layers/${name}`;
+                                // We need to check if it is a group or dataset.
+                                // h5ls localPath/layers/name
+                                let isLayerSparse = false;
+                                try {
+                                    const layerStdout = await runCommand('h5ls', [localPath + layerPath]);
+                                    if (layerStdout.includes('data') && layerStdout.includes('indices') && layerStdout.includes('indptr')) {
+                                        isLayerSparse = true;
+                                    }
+                                } catch (e) {}
+
+                                if (isLayerSparse) {
+                                    const type = await checkMatrixType(localPath, `${layerPath}/data`, false);
+                                    matrices.push({ name: `layers/${name}`, type });
+                                } else {
+                                    const type = await checkMatrixType(localPath, layerPath, true);
+                                    matrices.push({ name: `layers/${name}`, type });
                                 }
                             } catch (e) {}
-
-                            if (isLayerSparse) {
-                                const type = await checkMatrixType(localPath, `${layerPath}/data`, false);
-                                matrices.push({ name: `layers/${name}`, type });
-                            } else {
-                                const type = await checkMatrixType(localPath, layerPath, true);
-                                matrices.push({ name: `layers/${name}`, type });
-                            }
-                        } catch (e) {}
+                        }
                     }
                 }
-            }
-        } catch (e) {}
+            } catch (e) {}
+        }
 
         return matrices;
     } finally {
@@ -544,12 +549,13 @@ export async function analyzeMatrices(filePath: string): Promise<MatrixInfo[]> {
 /**
  * Analyze obsm entries
  */
-export async function analyzeObsm(filePath: string): Promise<ObsmInfo[]> {
+export async function analyzeObsm(filePath: string, prefix: string = ''): Promise<ObsmInfo[]> {
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
         const obsmInfo: ObsmInfo[] = [];
         try {
-            const stdout = await runCommand('h5ls', [localPath + '/obsm']);
+            const obsmPath = prefix ? `${prefix}/obsm` : '/obsm';
+            const stdout = await runCommand('h5ls', [localPath + obsmPath]);
             const lines = stdout.split('\n');
             for (const line of lines) {
                 const parts = line.trim().split(/\s+/);
@@ -557,7 +563,7 @@ export async function analyzeObsm(filePath: string): Promise<ObsmInfo[]> {
                     const name = parts[0];
                     if (name) {
                         try {
-                            const info = await getDatasetInfo(localPath, `/obsm/${name}`);
+                            const info = await getDatasetInfo(localPath, `${obsmPath}/${name}`);
                             const columns = info.shape.length > 1 ? info.shape[1] : 1;
                             obsmInfo.push({ name, columns });
                         } catch (e) {}
@@ -572,19 +578,38 @@ export async function analyzeObsm(filePath: string): Promise<ObsmInfo[]> {
 }
 
 /**
+ * Check if .raw exists in the h5ad file
+ */
+export async function checkRaw(filePath: string): Promise<boolean> {
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
+    try {
+        await runCommand('h5ls', [localPath + '/raw']);
+        return true;
+    } catch (e) {
+        return false;
+    } finally {
+        if (isTemp) cleanupTempFile(localPath);
+    }
+}
+
+/**
  * Read complete h5ad metadata for design analysis
  */
-export async function readH5ADMetadata(filePath: string): Promise<H5ADMetadata> {
+export async function readH5ADMetadata(filePath: string, useRaw: boolean = false): Promise<H5ADMetadata> {
     // We can reuse the local file path to avoid multiple downloads/copies
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     
     try {
-        const totalCells = await getTotalCells(localPath);
-        const species = await detectSpecies(localPath);
-        const geneCount = await getGeneCount(localPath);
+        const prefix = useRaw ? '/raw' : '';
+        const hasRaw = await checkRaw(localPath);
+        console.log(`Checking raw for ${localPath}: ${hasRaw}`);
+
+        const totalCells = await getTotalCells(localPath, prefix);
+        const species = await detectSpecies(localPath, prefix);
+        const geneCount = await getGeneCount(localPath, prefix);
         const factorNames = await listFactors(localPath);
-        const matrices = await analyzeMatrices(localPath);
-        const obsm = await analyzeObsm(localPath);
+        const matrices = await analyzeMatrices(localPath, prefix);
+        const obsm = await analyzeObsm(localPath, prefix);
 
         const factors = new Map<string, FactorInfo>();
 
@@ -609,7 +634,7 @@ export async function readH5ADMetadata(filePath: string): Promise<H5ADMetadata> 
             factors.set(name, { name, categories, counts, type });
         }
 
-        return { totalCells, factors, species, geneCount, matrices, obsm };
+        return { totalCells, factors, species, geneCount, matrices, obsm, hasRaw };
     } finally {
         if (isTemp) cleanupTempFile(localPath);
     }
