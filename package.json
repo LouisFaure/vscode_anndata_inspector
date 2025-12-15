@@ -1,0 +1,77 @@
+{
+    "name": "anndata-inspector",
+    "displayName": "AnnData Inspector",
+    "description": "Inspect and visualize single cell metadata from AnnData h5ad files",
+    "version": "0.1.0",
+    "publisher": "anndata-inspector",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Data Science",
+        "Visualization",
+        "Other"
+    ],
+    "keywords": [
+        "anndata",
+        "h5ad",
+        "single-cell",
+        "metadata",
+        "hdf5"
+    ],
+    "activationEvents": [],
+    "main": "./out/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "anndata.inspectFile",
+                "title": "AnnData: Inspect H5AD File"
+            }
+        ],
+        "customEditors": [
+            {
+                "viewType": "anndata.h5adViewer",
+                "displayName": "H5AD Viewer",
+                "selector": [
+                    {
+                        "filenamePattern": "*.h5ad"
+                    }
+                ],
+                "priority": "default"
+            }
+        ],
+        "languages": [
+            {
+                "id": "h5ad",
+                "extensions": [
+                    ".h5ad"
+                ],
+                "aliases": [
+                    "H5AD",
+                    "AnnData"
+                ]
+            }
+        ]
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./",
+        "pretest": "npm run compile",
+        "test": "mocha out/test/**/*.test.js",
+        "lint": "eslint src --ext ts"
+    },
+    "devDependencies": {
+        "@types/mocha": "^10.0.10",
+        "@types/node": "^20.10.0",
+        "@types/vscode": "^1.85.0",
+        "@typescript-eslint/eslint-plugin": "^6.13.0",
+        "@typescript-eslint/parser": "^6.13.0",
+        "eslint": "^8.54.0",
+        "mocha": "^11.7.5",
+        "typescript": "^5.3.0"
+    },
+    "dependencies": {
+        "h5wasm": "^0.7.5"
+    }
+}
