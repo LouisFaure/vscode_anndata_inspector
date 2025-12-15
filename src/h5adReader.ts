@@ -56,13 +56,13 @@ function cleanupTempFile(p: string) {
     try {
         if (fs.existsSync(p)) fs.unlinkSync(p);
         tempFiles.delete(p);
-    } catch (e) {}
+    } catch (e) { }
 }
 
 // Ensure cleanup on exit
 process.on('exit', () => {
     for (const file of tempFiles) {
-        try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (e) {}
+        try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (e) { }
     }
 });
 
@@ -107,11 +107,11 @@ interface DatasetInfo {
 async function getDatasetInfo(filePath: string, datasetPath: string): Promise<DatasetInfo> {
     // Remove -d to avoid dumping data and exceeding buffer
     const stdout = await runCommand('h5ls', ['-v', `${filePath}/${datasetPath}`]);
-    
+
     // Parse Shape
     // Output example: "    Dataset {10/10, 5/5}" or "    Dataset {10}"
     const shapeMatch = stdout.match(/Dataset \{([0-9, \/]+)\}/);
-    const shape = shapeMatch 
+    const shape = shapeMatch
         ? shapeMatch[1].split(',').map(s => parseInt(s.split('/')[0].trim()))
         : [];
 
@@ -184,18 +184,18 @@ export async function listFactors(filePath: string): Promise<string[]> {
         }
 
         const lines = stdout.split('\n');
-        
+
         // Find groups in obs that have both categories and codes
         // Map: groupPath -> Set of children
         const groups = new Map<string, Set<string>>();
-        
+
         for (const line of lines) {
             // Line format: /path/to/obj  Type
             const parts = line.trim().split(/\s+/);
             if (parts.length < 2) continue;
-            
+
             let objPath = parts[0];
-            
+
             if (isObsScan) {
                 // If we listed /obs, paths are relative to it (e.g. /factor or factor)
                 // We need to reconstruct full path /obs/factor
@@ -214,7 +214,7 @@ export async function listFactors(filePath: string): Promise<string[]> {
             if (objPath.startsWith('/obs/')) {
                 const parent = path.dirname(objPath);
                 const name = path.basename(objPath);
-                
+
                 if (!groups.has(parent)) groups.set(parent, new Set());
                 groups.get(parent)?.add(name);
             }
@@ -243,13 +243,13 @@ export async function extractCategories(filePath: string, factorName: string): P
     try {
         const datasetPath = `/obs/${factorName}/categories`;
         const info = await getDatasetInfo(localPath, datasetPath);
-        
+
         if (info.typeClass === 'string' && info.typeSize > 0) {
             // Fixed length strings
             const buffer = await readDatasetBinary(localPath, datasetPath, info);
             const categories: string[] = [];
             const count = info.shape[0] || 0;
-            
+
             for (let i = 0; i < count; i++) {
                 const start = i * info.typeSize;
                 const end = start + info.typeSize;
@@ -272,7 +272,7 @@ export async function extractCategories(filePath: string, factorName: string): P
             const categories: string[] = [];
             for (const m of matches) {
                 if (m[1] !== 'HDF5') { // Skip header if matched accidentally
-                     categories.push(m[1]);
+                    categories.push(m[1]);
                 }
             }
             // Filter out header noise if any
@@ -304,10 +304,10 @@ export async function countCells(filePath: string, factorName: string): Promise<
 
         const codesPath = `/obs/${factorName}/codes`;
         const info = await getDatasetInfo(localPath, codesPath);
-        
+
         if (info.typeClass === 'integer') {
             const buffer = await readDatasetBinary(localPath, codesPath, info);
-            
+
             // Create typed array view
             let view: ArrayLike<number>;
             if (info.typeSize === 1) view = info.isSigned ? new Int8Array(buffer.buffer) : new Uint8Array(buffer.buffer);
@@ -344,7 +344,7 @@ async function getSparseMatrixShape(filePath: string, groupPath: string): Promis
                 return parts;
             }
         }
-    } catch (e) {}
+    } catch (e) { }
     return [];
 }
 
@@ -359,7 +359,7 @@ export async function getTotalCells(filePath: string, prefix: string = ''): Prom
             try {
                 const info = await getDatasetInfo(localPath, idxPath);
                 if (info.shape.length > 0) return info.shape[0];
-            } catch (e) {}
+            } catch (e) { }
         }
 
         // Try X
@@ -367,15 +367,15 @@ export async function getTotalCells(filePath: string, prefix: string = ''): Prom
             const xPath = prefix ? `${prefix}/X` : '/X';
             const info = await getDatasetInfo(localPath, xPath);
             if (info.shape.length > 0) return info.shape[0];
-            
+
             // If empty shape, maybe it is sparse (Group)
             const shape = await getSparseMatrixShape(localPath, xPath);
             if (shape.length > 0) return shape[0];
-            
+
             // Fallback: check indptr
             const indptrInfo = await getDatasetInfo(localPath, `${xPath}/indptr`);
             if (indptrInfo.shape.length > 0) return indptrInfo.shape[0] - 1;
-        } catch (e) {}
+        } catch (e) { }
 
         return 0;
     } finally {
@@ -407,7 +407,7 @@ export async function detectSpecies(filePath: string, prefix: string = ''): Prom
                         break;
                     }
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         if (geneNames.length === 0) return 'unknown';
@@ -447,18 +447,18 @@ export async function getGeneCount(filePath: string, prefix: string = ''): Promi
             try {
                 const info = await getDatasetInfo(localPath, idxPath);
                 if (info.shape.length > 0) return info.shape[0];
-            } catch (e) {}
+            } catch (e) { }
         }
 
         try {
             const xPath = prefix ? `${prefix}/X` : '/X';
             const info = await getDatasetInfo(localPath, xPath);
             if (info.shape.length > 1) return info.shape[1];
-            
+
             // Sparse
             const shape = await getSparseMatrixShape(localPath, xPath);
             if (shape.length > 1) return shape[1];
-        } catch (e) {}
+        } catch (e) { }
 
         return 0;
     } finally {
@@ -488,7 +488,7 @@ async function readFirstFiveValues(filePath: string, datasetPath: string): Promi
             }
             return values;
         }
-    } catch (e) {}
+    } catch (e) { }
     return [];
 }
 
@@ -501,7 +501,7 @@ async function checkMatrixType(filePath: string, datasetPath: string, isDense: b
     try {
         const info = await getDatasetInfo(filePath, datasetPath);
         if (info.typeClass === 'integer') return 'integer';
-        
+
         if (isDense) {
             // If dense, just say it is dense (float) and skip value check
             return 'float';
@@ -510,7 +510,7 @@ async function checkMatrixType(filePath: string, datasetPath: string, isDense: b
         // If sparse and float storage, check first 5 non-zero values
         const values = await readFirstFiveValues(filePath, datasetPath);
         if (values.length === 0) return 'float'; // Default
-        
+
         const allIntegers = values.every(v => Number.isInteger(v));
         return allIntegers ? 'integer' : 'float';
     } catch (e) {
@@ -525,20 +525,20 @@ export async function analyzeMatrices(filePath: string, prefix: string = ''): Pr
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
     try {
         const matrices: MatrixInfo[] = [];
-        
+
         // Check X
         try {
             // Check if X is group (sparse) or dataset (dense)
             // h5ls localPath/X
             const xPath = prefix ? `${prefix}/X` : '/X';
             const stdout = await runCommand('h5ls', [localPath + xPath]);
-            
+
             let isSparse = false;
             // Sparse matrix in AnnData is a Group containing data, indices, indptr
             if (stdout.includes('data') && stdout.includes('indices') && stdout.includes('indptr')) {
                 isSparse = true;
             }
-            
+
             if (isSparse) {
                 const type = await checkMatrixType(localPath, `${xPath}/data`, false);
                 matrices.push({ name: prefix ? 'raw/X' : 'X', type });
@@ -547,7 +547,7 @@ export async function analyzeMatrices(filePath: string, prefix: string = ''): Pr
                 const type = await checkMatrixType(localPath, xPath, true);
                 matrices.push({ name: prefix ? 'raw/X' : 'X', type });
             }
-        } catch (e) {}
+        } catch (e) { }
 
         if (!prefix) {
             // Check layers
@@ -570,7 +570,7 @@ export async function analyzeMatrices(filePath: string, prefix: string = ''): Pr
                                     if (layerStdout.includes('data') && layerStdout.includes('indices') && layerStdout.includes('indptr')) {
                                         isLayerSparse = true;
                                     }
-                                } catch (e) {}
+                                } catch (e) { }
 
                                 if (isLayerSparse) {
                                     const type = await checkMatrixType(localPath, `${layerPath}/data`, false);
@@ -579,11 +579,11 @@ export async function analyzeMatrices(filePath: string, prefix: string = ''): Pr
                                     const type = await checkMatrixType(localPath, layerPath, true);
                                     matrices.push({ name: `layers/${name}`, type });
                                 }
-                            } catch (e) {}
+                            } catch (e) { }
                         }
                     }
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         return matrices;
@@ -608,15 +608,35 @@ export async function analyzeObsm(filePath: string, prefix: string = ''): Promis
                 if (parts.length >= 1) {
                     const name = parts[0];
                     if (name) {
+                        let columns = 1;
                         try {
                             const info = await getDatasetInfo(localPath, `${obsmPath}/${name}`);
-                            const columns = info.shape.length > 1 ? info.shape[1] : 1;
+                            if (info.shape.length > 1) {
+                                columns = info.shape[1];
+                            } else {
+                                // Maybe it is sparse (Group)
+                                const shape = await getSparseMatrixShape(localPath, `${obsmPath}/${name}`);
+                                if (shape.length > 1) {
+                                    columns = shape[1];
+                                }
+                            }
                             obsmInfo.push({ name, columns });
-                        } catch (e) {}
+                        } catch (e) {
+                            // If direct dataset info fails, it might be a Group (sparse) 
+                            // that getDatasetInfo didn't handle well or threw on.
+                            // Try sparse shape directly if we haven't already.
+                            try {
+                                const shape = await getSparseMatrixShape(localPath, `${obsmPath}/${name}`);
+                                if (shape.length > 1) {
+                                    columns = shape[1];
+                                    obsmInfo.push({ name, columns });
+                                }
+                            } catch (e2) { }
+                        }
                     }
                 }
             }
-        } catch (e) {}
+        } catch (e) { }
         return obsmInfo;
     } finally {
         if (isTemp) cleanupTempFile(localPath);
@@ -647,7 +667,7 @@ export async function readH5ADMetadata(filePath: string, useRaw: boolean = false
 
     // We can reuse the local file path to avoid multiple downloads/copies
     const { path: localPath, isTemp } = await ensureLocalFile(filePath);
-    
+
     try {
         const prefix = useRaw ? '/raw' : '';
         const hasRaw = await checkRaw(localPath);
