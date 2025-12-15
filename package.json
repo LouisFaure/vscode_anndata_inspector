@@ -6,7 +6,7 @@
     "publisher": "anndata-inspector",
     "repository": {
         "type": "git",
-        "url": "https://github.com/<owner>/anndata-design-inspector"
+        "url": "https://github.com/LouisFaure/vscode_anndata_inspector"
     },
     "engines": {
         "vscode": "^1.85.0"
