@@ -17,6 +17,16 @@ Inspect and visualize single cell metadata from AnnData (`.h5ad`) files directly
 ## Requirements
 
 - VS Code 1.85.0 or newer
+- HDF5 command-line tools (h5ls and h5dump) must be installed:
+
+macOS:
+```bash
+brew install hdf5
+```
+Linux (Debian/Ubuntu):
+```bash
+sudo apt-get install hdf5-tools
+```
 
 ## Installation via Source
 
