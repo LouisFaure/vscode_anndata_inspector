@@ -248,7 +248,7 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
             })
             .join('');
 
-        const rawButton = (metadata.hasRaw && !isRawView) 
+        const rawButton = (metadata.hasRaw && !isRawView)
             ? `<button onclick="vscode.postMessage({command: 'viewRaw'})" class="raw-btn">View Raw Data</button>`
             : '';
 
@@ -441,6 +441,10 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
             <div class="meta-label">Species</div>
             <div class="meta-value">${this.getSpeciesEmoji(metadata.species)} ${this.capitalize(metadata.species)}</div>
         </div>
+        <div class="meta-card">
+            <div class="meta-label">Compression</div>
+            <div class="meta-value">${this.getCompressionDisplay(metadata.compression)}</div>
+        </div>
     </div>
 
     <h2>Data Structure</h2>
@@ -537,5 +541,22 @@ export class H5ADEditorProvider implements vscode.CustomReadonlyEditorProvider {
             unknown: '❓'
         };
         return emojis[species] || '🧬';
+    }
+
+    private getCompressionDisplay(compression: any): string {
+        if (!compression || !compression.isCompressed) {
+            return '📦 None';
+        }
+
+        let display = '🗜️ ';
+        const algo = compression.algorithm ? compression.algorithm.toUpperCase() : 'Compressed';
+
+        if (compression.level !== null && compression.level !== undefined) {
+            display += `${algo} (L${compression.level})`;
+        } else {
+            display += algo;
+        }
+
+        return display;
     }
 }

@@ -31,6 +31,12 @@ export interface ObsmInfo {
     columns: number;
 }
 
+export interface CompressionInfo {
+    isCompressed: boolean;
+    algorithm: string | null; // e.g., 'gzip', 'lzf', 'zstd', etc.
+    level: number | null;
+}
+
 export interface H5ADMetadata {
     totalCells: number;
     factors: Map<string, FactorInfo>;
@@ -39,6 +45,7 @@ export interface H5ADMetadata {
     matrices: MatrixInfo[];
     obsm: ObsmInfo[];
     hasRaw: boolean;
+    compression: CompressionInfo;
 }
 
 // Helper to manage temp files
@@ -659,6 +666,90 @@ export async function checkRaw(filePath: string): Promise<boolean> {
 }
 
 /**
+ * Check compression settings on the h5ad file by inspecting the X matrix
+ * Uses h5ls -v to get filter (compression) information
+ */
+export async function checkCompression(filePath: string): Promise<CompressionInfo> {
+    const { path: localPath, isTemp } = await ensureLocalFile(filePath);
+    try {
+        // First check if X is sparse (Group) or dense (Dataset)
+        let datasetPath = '/X';
+        try {
+            const xContent = await runCommand('h5ls', [localPath + '/X']);
+            // If X is sparse, check the /X/data dataset instead
+            if (xContent.includes('data') && xContent.includes('indices') && xContent.includes('indptr')) {
+                datasetPath = '/X/data';
+            }
+        } catch (e) {
+            // X might not exist, return no compression info
+            return { isCompressed: false, algorithm: null, level: null };
+        }
+
+        // Get verbose info including filters
+        const stdout = await runCommand('h5ls', ['-v', localPath + datasetPath]);
+
+        // Look for filter information in the output
+        // Example outputs:
+        // "Filter-0: deflate-1 OPT {9}"  (gzip with level 9)
+        // "Filter-0: shuffle-0 OPT {}"
+        // "Filter-1: gzip-1 OPT {4}"
+        // "Filter-0: lzf-32000 OPT {4, 261, 400}"  (lzf has multiple params)
+        // "Filter-0: zstd-32015 OPT {3}"
+
+        // Match Filter lines - allow any content in braces
+        const filterMatch = stdout.match(/Filter-\d+:\s+(\w+)(?:-\d+)?\s+OPT\s+\{([^}]*)\}/gi);
+
+        if (!filterMatch || filterMatch.length === 0) {
+            return { isCompressed: false, algorithm: null, level: null };
+        }
+
+        // Parse filter info - look for compression filters (not shuffle)
+        let algorithm: string | null = null;
+        let level: number | null = null;
+
+        for (const match of filterMatch) {
+            const parts = match.match(/Filter-\d+:\s+(\w+)(?:-\d+)?\s+OPT\s+\{([^}]*)\}/i);
+            if (parts) {
+                const filterName = parts[1].toLowerCase();
+                const filterParams = parts[2]?.trim();
+
+                // Skip shuffle filter, it's not compression
+                if (filterName === 'shuffle') continue;
+
+                // Map common filter names
+                if (filterName === 'deflate') {
+                    algorithm = 'gzip';
+                } else {
+                    algorithm = filterName;
+                }
+
+                // Try to extract level from first parameter (if numeric)
+                if (filterParams) {
+                    const firstParam = filterParams.split(',')[0].trim();
+                    const parsedLevel = parseInt(firstParam);
+                    if (!isNaN(parsedLevel)) {
+                        level = parsedLevel;
+                    }
+                }
+
+                // Found a compression filter, break
+                break;
+            }
+        }
+
+        if (algorithm) {
+            return { isCompressed: true, algorithm, level };
+        }
+
+        return { isCompressed: false, algorithm: null, level: null };
+    } catch (e) {
+        return { isCompressed: false, algorithm: null, level: null };
+    } finally {
+        if (isTemp) cleanupTempFile(localPath);
+    }
+}
+
+/**
  * Read complete h5ad metadata for design analysis
  */
 export async function readH5ADMetadata(filePath: string, useRaw: boolean = false): Promise<H5ADMetadata> {
@@ -671,7 +762,9 @@ export async function readH5ADMetadata(filePath: string, useRaw: boolean = false
     try {
         const prefix = useRaw ? '/raw' : '';
         const hasRaw = await checkRaw(localPath);
+        const compression = await checkCompression(localPath);
         console.log(`Checking raw for ${localPath}: ${hasRaw}`);
+        console.log(`Compression detected: ${compression.isCompressed ? compression.algorithm : 'none'}`);
 
         const totalCells = await getTotalCells(localPath, prefix);
         const species = await detectSpecies(localPath, prefix);
@@ -703,7 +796,7 @@ export async function readH5ADMetadata(filePath: string, useRaw: boolean = false
             factors.set(name, { name, categories, counts, type });
         }
 
-        return { totalCells, factors, species, geneCount, matrices, obsm, hasRaw };
+        return { totalCells, factors, species, geneCount, matrices, obsm, hasRaw, compression };
     } finally {
         if (isTemp) cleanupTempFile(localPath);
     }
